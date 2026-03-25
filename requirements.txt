@@ -1,0 +1,25 @@
+# Aether Omega — Python dependencies
+# Python 3.12+ required
+#
+# ── PyTorch ───────────────────────────────────────────────────────────────────
+# AMD ROCm (used in this project — AMD RX 7800 XT):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.2
+#
+# NVIDIA CUDA:
+#   pip install torch torchvision torchaudio
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Core ML
+torch>=2.2.0
+safetensors>=0.4.0
+numpy>=1.26.0
+
+# Training utilities
+bitsandbytes>=0.43.0     # 8-bit Adam optimizer (optional, falls back to AdamW)
+tqdm>=4.66.0
+rich>=13.0.0
+
+# Dataset pipeline (build_dataset.py)
+datasets>=2.18.0
+huggingface_hub>=0.22.0

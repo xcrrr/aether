@@ -1,0 +1,36 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.so
+
+# ── Virtual environment ────────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Training data (generated — run build_dataset.py to recreate) ──────────────
+data/*.jsonl
+data/*.bin
+
+# ── Model checkpoints & weights (large binary files) ──────────────────────────
+checkpoints_omega/step_*/
+*.safetensors
+*.pt
+*.pth
+
+# ── Claude Code session data ───────────────────────────────────────────────────
+.claude/
+
+# ── Triton / ROCm kernel cache ─────────────────────────────────────────────────
+.triton/
+
+# ── Dev utilities (one-off scripts, not core) ─────────────────────────────────
+probe_fields.py
+
+# ── Misc ───────────────────────────────────────────────────────────────────────
+.DS_Store
+.env
+*.log

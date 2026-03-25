@@ -535,10 +535,10 @@ def load_checkpoint(
     opt:     torch.optim.Optimizer,
     prefix:  str,
 ) -> dict:
-    # v2: strict=False for backward compatibility with pre-v2 checkpoints
+    # strict=False: tolerates optional fields added in future architecture revisions
     info = model.load_state_dict(load_file(prefix + "_main.safetensors"), strict=False)
     if info.missing_keys:
-        print(f"[ckpt] model missing keys (v2 new params): {info.missing_keys}")
+        print(f"[ckpt] model missing keys: {info.missing_keys}")
     if info.unexpected_keys:
         print(f"[ckpt] model unexpected keys: {info.unexpected_keys}")
 
@@ -546,7 +546,7 @@ def load_checkpoint(
 
     ema_info = ema.load_state_dict(load_file(prefix + "_ema.safetensors"), strict=False)
     if ema_info.missing_keys:
-        print(f"[ckpt] EMA missing keys (v2 new params): {ema_info.missing_keys}")
+        print(f"[ckpt] EMA missing keys: {ema_info.missing_keys}")
 
     try:
         opt.load_state_dict(torch.load(prefix + "_optimizer.pt", map_location=DEVICE,

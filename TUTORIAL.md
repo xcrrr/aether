@@ -205,13 +205,13 @@ print(f'  TOTAL: {sum(c.values()):,}')
 
 ## 4. Smoke Tests
 
-Run the 45 architectural smoke tests before training. These validate NaN safety, Poincaré ball geometry, CSSC curvature coupling, GGR geodesic routing, SSM gradients, tokenizer round-trip, and a full mini-pipeline.
+Run the 56 architectural smoke tests before training. These validate NaN safety, Poincaré ball geometry, CSSC curvature coupling, GGR geodesic routing, SSM gradients, tokenizer round-trip, and a full mini-pipeline.
 
 ```bash
 python smoke_test.py
 ```
 
-**Expected:** All 45 tests show `PASS` and `SUMMARY: PASSED: 45 / FAILED: 0`. Any `FAIL` means a NaN or Inf was detected — do not train until resolved.
+**Expected:** All 56 tests show `PASS` and `SUMMARY: PASSED: 56 / FAILED: 0`. Any `FAIL` means a NaN or Inf was detected — do not train until resolved.
 
 **Key test groups:**
 | Group | What it validates |

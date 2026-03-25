@@ -43,7 +43,7 @@ RosettaObserver (~28M params, detached probe)
 | `dataset.py` | `OmegaDataset`, `PickyBatchSampler`, `collate_fn` |
 | `generate_data.py` | Local data from Python stdlib (no internet) |
 | `build_dataset.py` | HuggingFace streaming 10M dataset (9 sources, 4 groups) |
-| `smoke_test.py` | 45 tests — all must pass before training |
+| `smoke_test.py` | 56 tests — all must pass before training |
 | `inference.py` | Text generation from checkpoint |
 
 ## Novel Architectural Contributions
@@ -101,7 +101,7 @@ export TOKENIZERS_PARALLELISM=false
 ## Development Workflow
 
 ```bash
-# Smoke tests (45 tests — run before any code change validation)
+# Smoke tests (56 tests — run before any code change validation)
 python smoke_test.py
 
 # Self-test model architecture

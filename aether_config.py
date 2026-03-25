@@ -28,8 +28,9 @@ class OmegaConfig:
     dt_rank: int = 64               # Delta (Δ) projection rank; max(1, d_model//16)
     # Multi-Timescale SSM (Clockwork Mamba): d_state per layer group
     timescale_d_states: tuple[int, ...] = (8, 16, 32)  # fast / medium / slow
-    # SwiGLU feed-forward hidden dim: ceil(d_model * 8/3 / 256) * 256
-    ff_hidden: int = 2_816
+    # SwiGLU feed-forward hidden dim.  Must be divisible by n_moe_experts (3)
+    # so GGR experts get exact equal capacity.  2817 = 3 × 939 ≈ ceil(d_model*8/3)
+    ff_hidden: int = 2_817
     max_seq_len: int = 512
 
     # Continuous Thought Tokens (private scratchpad prepended to every sequence)
@@ -187,6 +188,10 @@ class OmegaConfig:
         assert self.num_epochs >= 1, "num_epochs must be >= 1"
         assert self.n_moe_experts >= 1, "n_moe_experts must be >= 1"
         assert self.moe_layer_stride >= 1, "moe_layer_stride must be >= 1"
+        assert self.ff_hidden % self.n_moe_experts == 0, (
+            f"ff_hidden ({self.ff_hidden}) must be divisible by n_moe_experts "
+            f"({self.n_moe_experts}) so GGR experts receive equal capacity"
+        )
 
     def summary(self) -> str:
         lines = [

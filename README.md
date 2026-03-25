@@ -274,7 +274,7 @@ python generate_data.py \
     --n-samples 60000 \
     --max-seq-len 512
 
-# Verify smoke tests (45 tests — all must pass before training)
+# Verify smoke tests (56 tests — all must pass before training)
 python smoke_test.py
 
 # Start training
@@ -426,7 +426,7 @@ aether2/
 │                        algorithm patterns, augmentation. Quick pipeline validation.
 ├── inference.py         Text generation from checkpoint: top-p nucleus + greedy.
 │                        Reports tok/s.
-├── smoke_test.py        45 tests: Poincaré NaN safety, CSSC per-token curvature,
+├── smoke_test.py        56 tests: Poincaré NaN safety, CSSC per-token curvature,
 │                        GGR geodesic routing, multi-timescale SSM, Möbius gradient
 │                        flow, tokenizer round-trip, full mini-pipeline.
 ├── probe_fields.py      Dev utility: verify HF dataset field names before a full

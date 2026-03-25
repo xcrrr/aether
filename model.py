@@ -682,6 +682,11 @@ class AetherOmegaModel(nn.Module):
                 nn.init.zeros_(block.geom_gate_ssm.bias)
                 nn.init.zeros_(block.geom_gate_ffn.weight)
                 nn.init.zeros_(block.geom_gate_ffn.bias)
+            # CSSC: re-zero W_cssc (normal_ above overwrites the zero-init in AetherMambaBlock)
+            # Zero-init → sigmoid(0)=0.5 → c_scale=1.0 → identity at training start.
+            if hasattr(block, 'W_cssc'):
+                nn.init.zeros_(block.W_cssc.weight)
+                nn.init.zeros_(block.W_cssc.bias)
 
     def forward(
         self,

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Build Aether Omega pre-training dataset — world-class 10M-sample data blend.
+"""Build Aether Omega pre-training dataset — high-quality curated blend (NO starcode).
 
-Dataset mixture (10M samples default):
-  30% code        — bigcode/starcoderdata (Python 2.9M + JS 25K) + Magicoder 75K
-  25% math        — HuggingFaceTB/finemath 2M + nvidia/OpenMathInstruct-2 500K
-  25% reasoning   — OpenThoughts3 1.2M + OpenR1-Math 220K + OpenMathInstruct-2 1.08M
-  20% educational — HuggingFaceFW/fineweb-edu 2M
+Fast, high-quality dataset optimized for 2-3 day turnaround (1M samples default):
+  25% code        — Magicoder (75K, verified instruct)
+  25% math        — OpenMathInstruct-2 verified (500K) + finemath
+  30% reasoning   — OpenThoughts3 (1.2M, world-class reasoning) + OpenR1-Math
+  20% educational — fineweb-edu (2M, education-filtered)
 
-All sources publicly accessible without gating.
+All sources: verified, high-trust, NO starcode (too slow).
 
 Output format (JSONL, one record per line):
   {"input_ids": [int x 512], "labels": [int x 512], "trust_score": float, "source": str}
@@ -17,12 +17,12 @@ Output format (JSONL, one record per line):
   All token IDs < vocab_size (32768).
   Minimum 16 non-PAD tokens per sample.
 
-Usage:
+Usage (fast, 1M samples):
   python build_dataset.py \\
       --train-tokenizer \\
       --output data/aether_train.jsonl \\
       --tokenizer omega_tokenizer.json \\
-      --n-samples 10000000 \\
+      --n-samples 1000000 \\
       --max-seq-len 512 \\
       --vocab-size 32768 \\
       --sort-by-difficulty \\
@@ -50,13 +50,13 @@ IGNORE_INDEX = -100
 MIN_TOKENS   = 16
 BASE_N       = 10_000_000
 
-# ── Group mix (must sum to 1.0) ──────────────────────────────────────────────
+# ── Group mix (must sum to 1.0) — NO starcode, high-quality only ──────────────
 
 GROUP_FRACTIONS: dict[str, float] = {
-    "code":        0.30,
-    "math":        0.25,
-    "reasoning":   0.25,
-    "educational": 0.20,
+    "code":        0.25,      # Magicoder only (no starcode — too slow)
+    "math":        0.25,      # OpenMathInstruct-2 + finemath
+    "reasoning":   0.30,      # OpenThoughts3 + OpenR1-Math (world-class)
+    "educational": 0.20,      # fineweb-edu (education-curated)
 }
 assert abs(sum(GROUP_FRACTIONS.values()) - 1.0) < 1e-9
 
@@ -86,12 +86,7 @@ SUBSOURCES: dict[str, list[SubSource]] = {
         SubSource("magicoder",      "code", 95.0,
                   "ise-uiuc/Magicoder-OSS-Instruct-75K",
                   fmt="magicoder", cap=75_000),
-        SubSource("starcoder_js",   "code", 88.0,
-                  "bigcode/starcoderdata",
-                  hf_data_dir="javascript", fmt="text", cap=25_000),
-        SubSource("starcoder_py",   "code", 90.0,
-                  "bigcode/starcoderdata",
-                  hf_data_dir="python", fmt="text"),                 # fill
+        # NOTE: Removed starcoder_py and starcoder_js (too slow). Use Magicoder only.
     ],
     "math": [
         SubSource("openmath_math",  "math", 96.0,
@@ -124,7 +119,7 @@ _BY_NAME: dict[str, SubSource] = {s.name: s for s in ALL_SUBSOURCES}
 
 # Representative source per group for tokenizer training (no skip, large corpus)
 _TOK_SOURCES: dict[str, str] = {
-    "code":        "starcoder_py",
+    "code":        "magicoder",          # (was starcoder_py, removed for speed)
     "math":        "finemath",
     "reasoning":   "openthoughts3",
     "educational": "fineweb_edu",
@@ -738,8 +733,8 @@ def main() -> None:
                    help="Output JSONL path (default: data/aether_train.jsonl)")
     p.add_argument("--tokenizer", default="omega_tokenizer.json",
                    help="Tokenizer JSON path (default: omega_tokenizer.json)")
-    p.add_argument("--n-samples", type=int, default=10_000_000,
-                   help="Total records to write (default: 10,000,000)")
+    p.add_argument("--n-samples", type=int, default=1_000_000,
+                   help="Total records to write (default: 1,000,000 — fast 2-3 day turnaround)")
     p.add_argument("--vocab-size", type=int, default=32_768,
                    help="Vocabulary size (default: 32768)")
     p.add_argument("--max-seq-len", type=int, default=512,
@@ -762,12 +757,15 @@ def main() -> None:
 
     # ── Train tokenizer ───────────────────────────────────────────────────
     if args.train_tokenizer:
-        n_tok = args.n_tokenizer_texts
-        # Auto-scale tokenizer training for small builds (fast smoke tests)
-        if args.n_samples < 100_000:
-            n_tok = min(n_tok, max(5_000, args.n_samples * 5))
-            print(f"[auto] Scaled tokenizer texts to {n_tok:,} for small build")
-        train_tokenizer(args.tokenizer, args.vocab_size, n_tok)
+        if Path(args.tokenizer).exists():
+            print(f"[tokenizer] '{args.tokenizer}' already exists. Skipping training.")
+        else:
+            n_tok = args.n_tokenizer_texts
+            # Auto-scale tokenizer training for small builds (fast smoke tests)
+            if args.n_samples < 100_000:
+                n_tok = min(n_tok, max(5_000, args.n_samples * 5))
+                print(f"[auto] Scaled tokenizer texts to {n_tok:,} for small build")
+            train_tokenizer(args.tokenizer, args.vocab_size, n_tok)
 
     # ── Build dataset ─────────────────────────────────────────────────────
     if args.n_samples > 0:

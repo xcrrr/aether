@@ -10,7 +10,7 @@
 
 ## What This Is
 
-Aether Omega is a decoder-only language model that replaces the standard Transformer attention mechanism with a Mamba-style Selective State Space Model (SSM) and runs the residual stream through Poincaré ball geometry instead of flat Euclidean space. It introduces two novel, previously unpublished architectural contributions — CSSC (Curvature-Selective State Coupling) and GGR (Geodesic Gravity Routing) — on top of five core pillars. It can be trained on either a local Python/math corpus generated from stdlib and algorithm patterns, or on up to 10M samples streamed from HuggingFace (code + math + reasoning + edu mixture). The goal is to validate these architectural ideas at ~445M scale on a single 16 GB GPU before requesting supercomputer time to ablate and scale them.
+Aether Omega is a decoder-only language model that replaces the standard Transformer attention mechanism with a Mamba-style Selective State Space Model (SSM) and runs the residual stream through Poincaré ball geometry instead of flat Euclidean space. It introduces two novel, previously unpublished architectural contributions — CSSC (Curvature-Selective State Coupling) and GGR (Geodesic Gravity Routing) — on top of five core pillars. It can be trained on either a local Python/math corpus generated from stdlib and algorithm patterns, or on 1M high-quality samples streamed from HuggingFace (curated code + math + reasoning + edu mixture, no starcode). The goal is to validate these architectural ideas at ~445M scale on a single 16 GB GPU in 2-3 days before requesting supercomputer time to ablate and scale them.
 
 There are no pretrained checkpoints to download. If you want to run this, you run the tokenizer, generate the data, and train from step 0.
 
@@ -281,9 +281,9 @@ python smoke_test.py
 python train.py
 ```
 
-### Option B — HuggingFace streaming data (10M samples, world-class 2025 blend)
+### Option B — HuggingFace streaming (1M samples, fast 2-3 day turnaround)
 
-All sources are publicly accessible — **no HuggingFace login or approval gates required**.
+**Fast, high-quality dataset** — NO starcode (too slow). All sources publicly accessible, no login required.
 
 ```bash
 cd /home/xcrr1/aether2
@@ -292,50 +292,45 @@ source venv/bin/activate
 export HSA_OVERRIDE_GFX_VERSION=11.0.0
 export PYTORCH_HIP_ALLOC_CONF=max_split_size_mb:512
 
-# Quick smoke test first (1000 samples, ~6 min)
+# Quick smoke test (1000 samples, ~2 min)
 python build_dataset.py \
     --train-tokenizer \
     --output /tmp/aether_smoke.jsonl \
     --tokenizer omega_tokenizer.json \
     --n-samples 1000
 
-# Full 10M build (tokenizer + dataset, ~8-18 hours)
+# Fast build: 1M samples (tokenizer + dataset, ~4-6 hours)
 python build_dataset.py \
     --train-tokenizer \
-    --n-tokenizer-texts 500000 \
+    --n-tokenizer-texts 100000 \
     --output data/aether_train.jsonl \
     --tokenizer omega_tokenizer.json \
-    --n-samples 10000000 \
+    --n-samples 1000000 \
     --max-seq-len 512 \
     --vocab-size 32768 \
     --sort-by-difficulty \
     --seed 42
 
 python smoke_test.py
-python train.py
+python train.py  # ~6-8 hours on AMD RX 7800 XT
 ```
 
-**Dataset mixture (10M records total — world-class 2025 blend):**
+**Dataset mixture (1M records — curated best sources only):**
 
-| Group | % | Records | Source | Notes |
-|-------|---|---------|--------|-------|
-| Code | 29.0% | 2.90M | `bigcode/starcoderdata` (Python) | The StarCoder training corpus. Billions of tokens, permissive licenses. Chunked into 512-token windows |
-| Code | 0.75% | 75K | `ise-uiuc/Magicoder-OSS-Instruct-75K` | High-quality problem+solution pairs across all languages. Used 1x |
-| Code | 0.25% | 25K | `bigcode/starcoderdata` (JavaScript) | Language diversity spice |
-| Math | 20.0% | 2.00M | `HuggingFaceTB/finemath` (`finemath-4plus`) | Massive math text corpus scored >= 4 by quality classifiers |
-| Math | 5.0% | 500K | `nvidia/OpenMathInstruct-2` | 14M math problem-solutions, verified against GSM8K/MATH ground truth. CC BY 4.0 |
-| Reasoning | 12.0% | 1.20M | `open-thoughts/OpenThoughts3-1.2M` | SOTA reasoning dataset (2025). 850K math + 250K code + 100K science. QwQ-32B reasoning traces. Trust: 98 |
-| Reasoning | 2.2% | 220K | `open-r1/OpenR1-Math-220k` | Verified chain-of-thought math reasoning |
-| Reasoning | 10.8% | 1.08M | `nvidia/OpenMathInstruct-2` (cont.) | Different samples from math portion, filling reasoning quota |
-| Educational | 20.0% | 2.00M | `HuggingFaceFW/fineweb-edu` (`CC-MAIN-2024-51`) | Web text filtered for educational quality |
+| Group | Fraction | Source | Notes |
+|-------|----------|--------|-------|
+| Code | 25% | `ise-uiuc/Magicoder-OSS-Instruct-75K` | Verified problem-solutions. High trust (95) |
+| Math | 25% | `nvidia/OpenMathInstruct-2` + `HuggingFaceTB/finemath` | OpenMath verified (96), finemath curated (93) |
+| Reasoning | 30% | `open-thoughts/OpenThoughts3-1.2M` + `open-r1/OpenR1-Math-220k` | SOTA 2025: QwQ-32B reasoning (98), verified math (95) |
+| Educational | 20% | `HuggingFaceFW/fineweb-edu` (`CC-MAIN-2024-51`) | Web text pre-filtered for education quality |
 
-**Key design choices:**
-- All sources streamed — no full dataset downloads to disk
-- Exact-match deduplication on first 64 tokens across all sources
-- Global interleave-shuffle (not block-sequential) for well-mixed output
-- Optional curriculum sorting by difficulty (`--sort-by-difficulty`)
-- Tokenizer trained on 500K proportional texts before dataset tokenization
-- Never repeats a sample more than 2x; small sources used exactly once
+**Design choices:**
+- Removed `bigcode/starcoderdata` (too slow for 2-3 day turnaround)
+- All sources streamed — no full downloads to disk
+- Interleave-shuffle for well-mixed output
+- Optional difficulty sorting (`--sort-by-difficulty`)
+- Tokenizer trained on proportional samples before dataset build
+- **Total training time estimate:** 4-6 hours data build + 6-8 hours training = ~12 hours wall-clock (2-3 days with overlapping work)
 
 ### Resume / inference
 
@@ -417,11 +412,11 @@ aether2/
 │                        curriculum), split_dataset() (seeded train/val), collate_fn.
 ├── tokenizer.py         OmegaTokenizer: pure-Python BPE, vocab_size=32768.
 │                        Special tokens: PAD=0, UNK=1, BOS=2, EOS=3.
-├── build_dataset.py     HuggingFace streaming data builder (2025 world-class blend):
-│                        30% code · 25% math · 25% reasoning · 20% educational.
-│                        9 sub-sources, 10M samples default. All public, no gating.
-│                        Interleave-shuffle, exact-match dedup, curriculum sort.
-│                        Trains 32k-vocab BPE tokenizer on 500k proportional texts.
+├── build_dataset.py     HuggingFace streaming data builder (high-quality, fast):
+│                        25% Magicoder · 25% math · 30% reasoning · 20% edu.
+│                        NO starcode (speed optimization). 1M samples default (4-6 hrs).
+│                        All public sources, no gating. Interleave-shuffle, dedup, sort.
+│                        Trains 32k-vocab BPE tokenizer on proportional texts first.
 ├── generate_data.py     Local data generator (no internet): stdlib introspection,
 │                        algorithm patterns, augmentation. Quick pipeline validation.
 ├── inference.py         Text generation from checkpoint: top-p nucleus + greedy.
@@ -455,10 +450,10 @@ aether2/
 - Neurogenesis rebuilds the optimizer when triggered, causing a brief (~1s) pause per event. GGR blocks are tracked separately from FFN blocks.
 
 **Data:**
-- Local corpus (`generate_data.py`): ~60k Python samples from stdlib + patterns. Sufficient to validate the pipeline; model will overfit within ~20k steps.
-- HuggingFace corpus (`build_dataset.py`): 10M samples across 9 sub-sources in 4 categories (code/math/reasoning/educational). All publicly accessible without gating or login. Requires internet access and ~8–18 hours to stream. Includes exact-match deduplication and global shuffle.
-- OpenThoughts3-1.2M provides SOTA reasoning traces (QwQ-32B generated, 1000+ ablation experiments). This dataset trained OpenThinker3-7B to beat DeepSeek-R1-Distill-7B.
-- Tokenizer vocabulary is 32768 BPE tokens trained on 500K proportional texts. Out-of-distribution text (non-English, non-code) will be over-segmented.
+- Local corpus (`generate_data.py`): ~60k Python samples from stdlib + patterns. Quick validation; will overfit within ~20k steps.
+- **HuggingFace corpus (`build_dataset.py`): 1M high-quality samples** — Magicoder (code) + OpenMathInstruct (math) + OpenThoughts3 (reasoning) + fineweb-edu (education). **NO starcode (too slow)**. 4–6 hour stream+tokenize, all public sources, no gating. Includes exact-match dedup and shuffle.
+- OpenThoughts3 provides world-class reasoning traces (QwQ-32B, verified math). Trained OpenThinker3-7B to beat DeepSeek-R1-Distill-7B.
+- BPE tokenizer: 32768 vocab, trained on proportional sample texts. Non-English/non-code text will over-segment.
 
 **Training stability:**
 - Loss spike detection skips optimizer steps, which can cause the LR schedule to drift slightly from wall-clock step count. This is an accepted trade-off.

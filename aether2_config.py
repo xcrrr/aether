@@ -89,6 +89,12 @@ class Aether2Config(OmegaConfig):
     # Tune: if avg iters stays at max → raise to 0.05; collapses to 1 → lower to 0.005
     fpa_ponder_weight: float = 0.01
 
+    # ── RosettaObserver ────────────────────────────────────────────────────
+    # Secondary ~25M-param decoder that runs on detached main-model hidden
+    # states.  Stop-gradient: Rosetta's loss never flows into the main model.
+    # Purpose: decode what the model encodes in Poincaré space at every step.
+    rosetta_enabled: bool = True
+
     # ── Baseline Shadow Model ──────────────────────────────────────────────
     # Lightweight EMA-updated vanilla transformer running in a shadow buffer
     # to provide real-time DELTA comparisons vs. Aether 2.
@@ -188,6 +194,8 @@ class Aether2Config(OmegaConfig):
             cfg.micro_moe_enabled = False
         if getattr(args, "no_baseline", False):
             cfg.baseline_enabled = False
+        if getattr(args, "no_rosetta", False):
+            cfg.rosetta_enabled = False
         # CPU offload: default OFF; --cpu-offload enables, --no-cpu-offload disables
         if getattr(args, "cpu_offload", False):
             cfg.cpu_offload_optimizer = True
@@ -215,6 +223,8 @@ class Aether2Config(OmegaConfig):
                             help="Disable GGR (run standard SwiGLU FFN)")
         parser.add_argument("--no-baseline", action="store_true",
                             help="Disable shadow baseline model")
+        parser.add_argument("--no-rosetta", action="store_true",
+                            help="Disable RosettaObserver probe")
         parser.add_argument("--cpu-offload", action="store_true",
                             help="Enable CPU optimizer offload (use on GPUs with < 12 GiB VRAM)")
         parser.add_argument("--no-cpu-offload", action="store_true",

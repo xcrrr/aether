@@ -6,6 +6,8 @@ Features:
   • Streaming JSONL dataset with circular buffer
   • CSSC + GGR ablation via --no-cssc / --no-ggr flags
   • Baseline shadow model with EMA for real-time delta metrics
+  • RosettaObserver: ~25M secondary decoder — latent-space interpretability probe
+  • Picky Learner: curriculum-warmed CE-range batch filtering
   • Aether Command Deck dashboard (--dashboard flag)
   • Detailed logging to logs/aether_build.log
   • Safetensors checkpointing
@@ -42,6 +44,7 @@ from safetensors.torch import load_file as st_load, save_file as st_save
 from aether2_config import Aether2Config
 from aether2_model import Aether2Model, ShadowModel
 from fluid_power import FluidPowerAllocator
+from model import RosettaObserver, log_map_zero
 from streaming_data import StreamingJSONLDataset
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -125,6 +128,10 @@ class TrainingMetrics:
     ponder_cost: float = 0.0
     fpa_avg_iters: float = 1.0         # mean passes per token
     fpa_halt_pct: float = 0.0          # fraction of tokens that early-exited
+    # RosettaObserver probe
+    rosetta_ce: float = 0.0            # Rosetta cross-entropy (0 if disabled)
+    # Picky Learner
+    picky_skipped: int = 0             # micro-batches skipped this log interval
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,6 +143,7 @@ def make_optimizer(
     cfg: Aether2Config,
     logger: logging.Logger,
     allocator: "FluidPowerAllocator | None" = None,
+    rosetta: "RosettaObserver | None" = None,
 ) -> torch.optim.Optimizer:
     """AdamW with separate param groups for geometry-sensitive params."""
     decay_params, no_decay_params, geo_params = [], [], []
@@ -159,6 +167,16 @@ def make_optimizer(
         for p in allocator.parameters():
             if p.requires_grad:
                 no_decay_params.append(p)
+
+    # RosettaObserver — standard decay/no-decay split, separate from main model
+    if rosetta is not None:
+        for name, p in rosetta.named_parameters():
+            if not p.requires_grad:
+                continue
+            if (p.ndim == 1) or ("norm" in name) or ("bias" in name):
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
 
     logger.info(
         f"Optimizer groups — decay: {len(decay_params)}, "
@@ -197,6 +215,21 @@ def set_lr(opt: torch.optim.Optimizer, lr: float) -> None:
         pg["lr"] = lr * pg.get("lr_scale", 1.0)
 
 
+def picky_thresholds(step: int, cfg: Aether2Config) -> tuple[float, float]:
+    """Return curriculum-adjusted (ce_min, ce_max) for the Picky Learner.
+
+    During warmup, thresholds are relaxed so that high-CE early-training
+    batches are not all rejected.  After curriculum_warmup steps, the
+    full [picky_ce_min, picky_ce_max] window is enforced.
+    """
+    if not cfg.curriculum_enabled:
+        return cfg.picky_ce_min, cfg.picky_ce_max
+    t = min(1.0, step / max(cfg.curriculum_warmup, 1))
+    ce_min = cfg.picky_ce_min * t
+    ce_max = cfg.picky_ce_max + (20.0 - cfg.picky_ce_max) * (1.0 - t)
+    return ce_min, ce_max
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # VRAM utilities
 # ─────────────────────────────────────────────────────────────────────────────
@@ -223,6 +256,7 @@ def save_checkpoint(
     cfg: Aether2Config,
     logger: logging.Logger,
     allocator: "FluidPowerAllocator | None" = None,
+    rosetta: "RosettaObserver | None" = None,
 ) -> None:
     ckpt_dir = Path(cfg.checkpoint_dir) / f"step_{step:08d}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -242,6 +276,12 @@ def save_checkpoint(
         st_save(
             {k: v.contiguous().cpu() for k, v in allocator.state_dict().items()},
             str(ckpt_dir / "allocator.safetensors"),
+        )
+    # RosettaObserver weights
+    if rosetta is not None:
+        st_save(
+            {k: v.contiguous().cpu() for k, v in rosetta.state_dict().items()},
+            str(ckpt_dir / "rosetta.safetensors"),
         )
     # Optimizer state
     torch.save(opt.state_dict(), ckpt_dir / "optimizer.pt")
@@ -263,6 +303,7 @@ def load_checkpoint(
     scaler: torch.cuda.amp.GradScaler,
     logger: logging.Logger,
     allocator: "FluidPowerAllocator | None" = None,
+    rosetta: "RosettaObserver | None" = None,
 ) -> int:
     """Load from checkpoint prefix. Returns resume step."""
     ckpt_dir = Path(prefix)
@@ -283,6 +324,12 @@ def load_checkpoint(
         alloc_w = st_load(str(alloc_f))
         allocator.load_state_dict(alloc_w, strict=False)
         logger.info("Loaded FPA allocator weights")
+
+    rosetta_f = ckpt_dir / "rosetta.safetensors"
+    if rosetta is not None and rosetta_f.exists():
+        rosetta_w = st_load(str(rosetta_f))
+        rosetta.load_state_dict(rosetta_w, strict=False)
+        logger.info("Loaded RosettaObserver weights")
 
     opt_f = ckpt_dir / "optimizer.pt"
     if opt_f.exists():
@@ -341,6 +388,16 @@ def train(
     if cfg.cpu_offload_optimizer:
         logger.info("CPU optimizer offload: ON — Adam m/v states will live in CPU RAM")
 
+    # ── RosettaObserver (latent-space interpretability probe) ─────────────────
+    rosetta: RosettaObserver | None = None
+    if cfg.rosetta_enabled:
+        rosetta = RosettaObserver(cfg).to(device=device, dtype=torch.bfloat16)
+        r_params = sum(p.numel() for p in rosetta.parameters())
+        logger.info(
+            f"RosettaObserver: ON  "
+            f"({r_params / 1e6:.1f}M params, weight={cfg.rosetta_weight})"
+        )
+
     # ── Fluid Power Allocator (optional) ─────────────────────────────────────
     allocator: FluidPowerAllocator | None = None
     if cfg.fpa_enabled:
@@ -353,7 +410,7 @@ def train(
         )
 
     # ── Optimizer & scaler ───────────────────────────────────────────────────
-    opt = make_optimizer(model, cfg, logger, allocator=allocator)
+    opt = make_optimizer(model, cfg, logger, allocator=allocator, rosetta=rosetta)
     # BF16 has the same dynamic range as FP32 — loss scaling is not needed.
     # GradScaler is disabled; scaler.scale/unscale/step/update are all no-ops.
     scaler = torch.amp.GradScaler("cuda", enabled=False)
@@ -362,7 +419,8 @@ def train(
     start_step = 0
     if resume_prefix:
         start_step = load_checkpoint(
-            resume_prefix, model, shadow, opt, scaler, logger, allocator=allocator
+            resume_prefix, model, shadow, opt, scaler, logger,
+            allocator=allocator, rosetta=rosetta,
         )
 
     # ── Dataset ──────────────────────────────────────────────────────────────
@@ -383,6 +441,8 @@ def train(
     accum_ce      = 0.0
     accum_aux     = 0.0
     accum_ponder  = 0.0
+    accum_rosetta = 0.0
+    accum_skipped = 0
     accum_count   = 0
     grad_norms   = collections.deque(maxlen=50)
     step_times   = collections.deque(maxlen=20)
@@ -416,21 +476,23 @@ def train(
             input_ids    = batch["input_ids"]    # (B, T)
             labels       = batch["labels"]       # (B, T)
             trust_scores = batch["trust_scores"] # (B,)
+            T_l = labels.shape[1]
 
             with torch.autocast("cuda", dtype=dtype, enabled=cfg.use_bf16):
                 if allocator is not None:
                     # FPA path: adaptive compute with entropy-conditioned re-routing
                     logits_aligned, ponder_cost, aux_loss = allocator(model, input_ids)
-                    # logits_aligned is already (B, T, V) — thought tokens stripped
+                    hidden_states_cap: dict = {}
                 else:
-                    logits, _, aux_loss = model(input_ids)
-                    # Align logits to labels: drop thought tokens from front
-                    T_l = labels.shape[1]
-                    logits_aligned = logits[:, -T_l:, :]   # (B, T, V)
+                    # Capture last hidden state for RosettaObserver if enabled
+                    capture_idx = {cfg.n_layers - 1} if rosetta is not None else set()
+                    logits, hidden_states_cap, aux_loss = model(
+                        input_ids, capture_hidden_indices=capture_idx
+                    )
+                    logits_aligned = logits[:, -T_l:, :]
                     ponder_cost = torch.tensor(0.0, device=device)
 
                 # CE loss (trust-weighted)
-                # logits_aligned is (B, T, V) in both FPA and standard paths
                 ce = F.cross_entropy(
                     logits_aligned.reshape(-1, cfg.vocab_size),
                     labels.reshape(-1),
@@ -438,25 +500,56 @@ def train(
                     reduction="none",
                 ).reshape(labels.shape)          # (B, T)
 
-                # Weight rows by trust scores.
-                # Raw scores are in [0, 100] range — normalise to [0, 1] so
-                # they act as a soft sample-importance weight, not a 93× LR boost.
+                # Normalise trust scores [0,100] → [0,1] for soft sample weighting
                 trust_w = (trust_scores / 100.0).clamp(0.0, 1.0)
                 trust_w = trust_w.unsqueeze(1).expand_as(ce)
                 ce_loss = (ce * trust_w).sum() / (trust_w.sum() + 1e-8)
 
+                # ── RosettaObserver loss ──────────────────────────────────
+                # hidden_states_cap[n_layers-1] is in Poincaré ball (detached).
+                # Convert to tangent space before passing to Rosetta.
+                # Stop-gradient is also enforced inside RosettaObserver.forward().
+                if rosetta is not None and (cfg.n_layers - 1) in hidden_states_cap:
+                    h_ball   = hidden_states_cap[cfg.n_layers - 1]
+                    h_tan    = log_map_zero(h_ball, cfg.hyp_curvature)
+                    r_logits = rosetta(h_tan)[:, -T_l:, :]
+                    rosetta_ce_loss = F.cross_entropy(
+                        r_logits.reshape(-1, cfg.vocab_size),
+                        labels.reshape(-1), ignore_index=-100,
+                    )
+                else:
+                    rosetta_ce_loss = torch.tensor(0.0, device=device)
+
                 ggr_aux    = aux_loss * cfg.ggr_lb_weight
                 ponder_reg = ponder_cost * cfg.fpa_ponder_weight
-                total_loss = ce_loss + ggr_aux + ponder_reg
+                total_loss = (ce_loss + ggr_aux + ponder_reg
+                              + rosetta_ce_loss * cfg.rosetta_weight)
 
                 # Gradient accumulation scale
                 total_loss = total_loss / cfg.grad_accum_steps
 
+            # ── Picky Learner: skip batch if CE outside curriculum window ──
+            ce_lo, ce_hi = picky_thresholds(step, cfg)
+            if ce_loss.item() < ce_lo or ce_loss.item() > ce_hi:
+                accum_skipped += 1
+                continue
+
             scaler.scale(total_loss).backward()
-            accum_ce     += ce_loss.item()
-            accum_aux    += ggr_aux.item()
-            accum_ponder += ponder_cost.item()
-            accum_count  += 1
+            accum_ce      += ce_loss.item()
+            accum_aux     += ggr_aux.item()
+            accum_ponder  += ponder_cost.item()
+            accum_rosetta += rosetta_ce_loss.item()
+            accum_count   += 1
+
+        # ── All micro-batches skipped by Picky Learner ────────────────────
+        if accum_count == 0:
+            logger.debug(
+                f"Step {step}: all {cfg.grad_accum_steps} micro-batches skipped "
+                f"by Picky Learner (CE range [{ce_lo:.2f}, {ce_hi:.2f}]) — no update"
+            )
+            opt.zero_grad(set_to_none=True)
+            accum_skipped = 0
+            continue
 
         # ── Optimizer step ────────────────────────────────────────────────
         # Restore Adam m/v from CPU RAM to GPU just before the update.
@@ -473,7 +566,7 @@ def train(
             logger.warning(f"Step {step}: Loss spike {mean_ce:.3f} > "
                            f"{aether2_loss_ema * cfg.loss_spike_threshold:.3f} — skipping step")
             opt.zero_grad(set_to_none=True)
-            accum_ce = accum_aux = accum_count = 0
+            accum_ce = accum_aux = accum_ponder = accum_rosetta = accum_count = accum_skipped = 0
             if cfg.cpu_offload_optimizer:
                 _offload_optimizer_to_cpu(opt)
             continue
@@ -557,7 +650,8 @@ def train(
                     cssc_ce = blk.cssc.context_efficiency
                     break
 
-            mean_ponder = accum_ponder / max(accum_count, 1)
+            mean_ponder  = accum_ponder  / max(accum_count, 1)
+            mean_rosetta = accum_rosetta / max(accum_count, 1)
             m = TrainingMetrics(
                 step=step,
                 epoch=getattr(dataset, "_epoch", 0),
@@ -580,8 +674,18 @@ def train(
                 ponder_cost=mean_ponder,
                 fpa_avg_iters=allocator.avg_iters if allocator is not None else 1.0,
                 fpa_halt_pct=allocator.halt_pct  if allocator is not None else 0.0,
+                rosetta_ce=mean_rosetta,
+                picky_skipped=accum_skipped,
             )
 
+            rosetta_str = (
+                f" | Rosetta={m.rosetta_ce:.4f}"
+                if cfg.rosetta_enabled else ""
+            )
+            picky_str = (
+                f" | skipped={m.picky_skipped}"
+                if m.picky_skipped > 0 else ""
+            )
             fpa_str = (
                 f" | FPA iters={m.fpa_avg_iters:.2f} ponder={m.ponder_cost:.4f}"
                 if cfg.fpa_enabled else ""
@@ -592,24 +696,24 @@ def train(
                 f"| VRAM={vram_alloc:.2f}/{vram_total:.1f}GiB "
                 f"| {tok_per_sec:.0f}tok/s "
                 f"| Baseline Δ={delta_pct:+.1f}%"
-                f"{fpa_str}"
+                f"{rosetta_str}{picky_str}{fpa_str}"
             )
 
             if metrics_callback is not None:
                 metrics_callback(m)
 
             # Reset accumulators
-            accum_ce = accum_aux = accum_ponder = accum_count = 0
+            accum_ce = accum_aux = accum_ponder = accum_rosetta = accum_count = accum_skipped = 0
 
         # ── Checkpoint ────────────────────────────────────────────────────
         if step > 0 and step % cfg.checkpoint_every == 0:
             save_checkpoint(step, model, shadow, opt, scaler, cfg, logger,
-                            allocator=allocator)
+                            allocator=allocator, rosetta=rosetta)
 
     # ── Final checkpoint ─────────────────────────────────────────────────────
     logger.info("Training complete. Saving final checkpoint…")
     save_checkpoint(cfg.max_steps, model, shadow, opt, scaler, cfg, logger,
-                    allocator=allocator)
+                    allocator=allocator, rosetta=rosetta)
     dataset.stop()
     logger.info("Done.")
 

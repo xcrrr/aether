@@ -296,5 +296,4 @@ throughput rises from ~425 tok/s to ~2 000–3 500 tok/s, cutting the full
 
 ## Author
 
-**Adam Parszewski** — Built for an AGH University supercomputer grant.
-All architectural components are original research. No pretrained weights.
+**Adam Parszewski** — All architectural components are original research. No pretrained weights.

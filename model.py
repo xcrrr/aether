@@ -261,49 +261,92 @@ class GeodesicGravityMoE(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Pure-PyTorch Mamba SSM (ROCm-compatible sequential scan)
+# Pure-PyTorch Mamba SSM (ROCm-compatible chunked scan)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _sequential_selective_scan(
-    x:       torch.Tensor,   # (B, T, D_inner)
-    delta:   torch.Tensor,   # (B, T, D_inner)
-    A:       torch.Tensor,   # (D_inner, d_state)  — negative values
-    B:       torch.Tensor,   # (B, T, d_state)
-    C:       torch.Tensor,   # (B, T, d_state)
-    D:       torch.Tensor,   # (D_inner,)
-) -> torch.Tensor:
-    """Memory-efficient sequential scan for the Mamba SSM recurrence.
+def _scan_chunk(
+    h_in: torch.Tensor,   # (B, Di, N)  carry from previous chunk
+    dt_c: torch.Tensor,   # (B, L, Di)  time steps
+    x_c:  torch.Tensor,   # (B, L, Di)  input
+    B_c:  torch.Tensor,   # (B, L, N)   SSM B slice
+    C_c:  torch.Tensor,   # (B, L, N)   SSM C slice
+    A_f:  torch.Tensor,   # (Di, N)     SSM A (shared across chunks)
+    D_f:  torch.Tensor,   # (Di,)       SSM D (shared across chunks)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Process one chunk of the selective scan. All inputs/outputs float32.
 
-    Pre-allocates output tensor.  All ops in float32 for numerical stability.
+    Returns (y_chunk: (B, L, Di), h_new: (B, Di, N)).
+
+    Called under torch.utils.checkpoint so only one chunk's intermediates
+    are live at a time during backward.
     """
+    log_A   = dt_c.unsqueeze(-1) * A_f
+    Bx      = dt_c.unsqueeze(-1) * (B_c.unsqueeze(2) * x_c.unsqueeze(-1))
+    log_P   = log_A.cumsum(dim=1)
+    P       = log_P.exp()
+    h_carry = P * h_in.unsqueeze(1)
+    inv_P   = (-log_P).clamp(max=30.0).exp()
+    h_fill  = P * (Bx * inv_P).cumsum(dim=1)
+    h_c     = h_carry + h_fill
+    h_c     = h_c / h_c.norm(dim=-1, keepdim=True).clamp(min=1.0)
+    y_c     = (h_c * C_c.unsqueeze(2)).sum(-1) + D_f * x_c
+    return y_c, h_c[:, -1, :, :]
+
+
+def _chunked_selective_scan(
+    x:          torch.Tensor,   # (B, T, D_inner)
+    delta:      torch.Tensor,   # (B, T, D_inner)
+    A:          torch.Tensor,   # (D_inner, d_state)  — negative values
+    B:          torch.Tensor,   # (B, T, d_state)
+    C:          torch.Tensor,   # (B, T, d_state)
+    D:          torch.Tensor,   # (D_inner,)
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """Chunked parallel scan with per-chunk gradient checkpointing.
+
+    During training (grad enabled): each chunk is wrapped in
+    torch.utils.checkpoint so only ONE chunk's backward intermediates are
+    live at a time.  Peak VRAM scales as O(chunk_size × Di × N × B) instead
+    of O(T × Di × N × B), enabling large micro_batch on 16 GB VRAM.
+
+    During inference (no grad): runs each chunk directly with no overhead.
+
+    T/chunk_size Python-level dispatch iterations (e.g. 8 for chunk_size=64).
+    All arithmetic in float32 for numerical stability.
+    """
+    from torch.utils.checkpoint import checkpoint as _ckpt
+
     B_sz, T, Di = x.shape
     N = A.shape[1]
 
     x_f     = x.float()
     delta_f = delta.float()
-    A_f     = A.float()
-    B_f     = B.float()
-    C_f     = C.float()
-    D_f     = D.float()
+    A_f     = A.float()          # (Di, N)
+    B_f     = B.float()          # (B, T, N)
+    C_f     = C.float()          # (B, T, N)
+    D_f     = D.float()          # (Di,)
 
     y = torch.empty(B_sz, T, Di, device=x.device, dtype=torch.float32)
     h = torch.zeros(B_sz, Di, N, device=x.device, dtype=torch.float32)
 
-    for t in range(T):
-        delta_t = delta_f[:, t, :]
-        x_t     = x_f[:, t, :]
-        B_t     = B_f[:, t, :]
-        C_t     = C_f[:, t, :]
+    use_ckpt = torch.is_grad_enabled()
 
-        delta_A = delta_t.unsqueeze(-1) * A_f.unsqueeze(0)
-        A_bar_t = torch.exp(delta_A)
-        B_bar_t = delta_t.unsqueeze(-1) * B_t.unsqueeze(1)
+    for cs in range(0, T, chunk_size):
+        ce   = min(cs + chunk_size, T)
+        dt_c = delta_f[:, cs:ce, :]
+        x_c  = x_f[:, cs:ce, :]
+        B_c  = B_f[:, cs:ce, :]
+        C_c  = C_f[:, cs:ce, :]
 
-        h = A_bar_t * h + B_bar_t * x_t.unsqueeze(-1)
-        # SSM state norm: divide by norm clamped to min=1.0
-        # No-op when norm ≤ 1; normalises to unit sphere when norm > 1.
-        h = h / h.norm(dim=-1, keepdim=True).clamp(min=1.0)
-        y[:, t, :] = (h * C_t.unsqueeze(1)).sum(dim=-1) + D_f * x_t
+        if use_ckpt:
+            y_c, h = _ckpt(
+                _scan_chunk, h, dt_c, x_c, B_c, C_c, A_f, D_f,
+                use_reentrant=False,
+            )
+        else:
+            y_c, h = _scan_chunk(h, dt_c, x_c, B_c, C_c, A_f, D_f)
+
+        y[:, cs:ce, :] = y_c
 
     return y.to(x.dtype)
 
@@ -374,7 +417,7 @@ class PurePyTorchSSM(nn.Module):
 
         A = -torch.exp(self.A_log.float())
 
-        y = _sequential_selective_scan(x_s, delta, A, B_ssm, C_ssm, self.D)
+        y = _chunked_selective_scan(x_s, delta, A, B_ssm, C_ssm, self.D)
         y = y * F.silu(z)
         out = self.out_proj(y)
 

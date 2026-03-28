@@ -1,4 +1,4 @@
-# Aether Omega — Python dependencies
+# Aether 2 — Python dependencies
 # Python 3.12+ required
 #
 # ── PyTorch ───────────────────────────────────────────────────────────────────

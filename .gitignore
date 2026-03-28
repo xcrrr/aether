@@ -11,15 +11,27 @@ venv/
 .venv/
 env/
 
-# ── Training data (generated — run build_dataset.py to recreate) ──────────────
+# ── Training data (large; run build_dataset.py to recreate) ──────────────────
 data/*.jsonl
 data/*.bin
+!data/.gitkeep
+
+# ── Tokenizer binary (large; regenerate with utils/tokenizer.py) ─────────────
+omega_tokenizer.json
 
 # ── Model checkpoints & weights (large binary files) ──────────────────────────
-checkpoints_omega/step_*/
+checkpoints_aether2/**
+!checkpoints_aether2/.gitkeep
+checkpoints_omega/**
+!checkpoints_omega/.gitkeep
 *.safetensors
 *.pt
 *.pth
+
+# ── Training logs ─────────────────────────────────────────────────────────────
+*.log
+logs/**
+!logs/.gitkeep
 
 # ── Claude Code session data ───────────────────────────────────────────────────
 .claude/
@@ -27,10 +39,6 @@ checkpoints_omega/step_*/
 # ── Triton / ROCm kernel cache ─────────────────────────────────────────────────
 .triton/
 
-# ── Dev utilities (one-off scripts, not core) ─────────────────────────────────
-probe_fields.py
-
 # ── Misc ───────────────────────────────────────────────────────────────────────
 .DS_Store
 .env
-*.log

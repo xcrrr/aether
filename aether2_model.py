@@ -156,13 +156,26 @@ class Aether2Block(nn.Module):
 
     # ── Block forward (no checkpointing — checkpointing applied in model) ─
 
-    def _forward_inner(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Inner forward. Returns (output, aux_loss)."""
+    def _forward_inner(
+        self,
+        x: torch.Tensor,
+        c_float: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Inner forward. Returns (output, aux_loss).
+
+        Parameters
+        ----------
+        c_float : pre-computed curvature value as a Python float.
+            When supplied by Aether2Model.forward() (which batches all curvature
+            reads into a single GPU→CPU sync), this avoids a per-block sync.
+            When None (e.g. block.forward() called standalone), falls back to
+            c_tensor.item() as before.
+        """
         # Derive c_tensor directly from self.curvature — preserves gradient path
         # when learnable_curvature=True so the parameter actually gets updated.
         # c (float) is still needed for Poincaré ops that require Python scalars.
         c_tensor = self.curvature.clamp(min=1e-4).to(device=x.device, dtype=torch.float32)
-        c = c_tensor.item()
+        c = c_float if c_float is not None else c_tensor.item()
 
         # Map from ball to tangent space
         h = log_map_zero(x, c)                        # (B, T, D) float → dtype
@@ -238,6 +251,7 @@ class Aether2Block(nn.Module):
         """Forward with gradient checkpointing support.
 
         Returns (output, aux_loss).
+        Called when the block is run standalone (no Aether2Model batching).
         """
         return self._forward_inner(x)
 
@@ -338,13 +352,26 @@ class Aether2Model(nn.Module):
         hidden_states: dict[int, torch.Tensor] = {}
         aux_loss = torch.tensor(0.0, device=x.device, dtype=torch.float32)
 
+        # ── Pre-fetch all block curvatures (one GPU→CPU sync instead of 24) ──
+        # Each block's c_tensor.item() forces a host-device sync; doing them all
+        # at once via .tolist() costs a single sync for the entire model forward.
+        # The float values are passed to _forward_inner so the per-block .item()
+        # call is skipped.
+        with torch.no_grad():
+            _c_all = torch.stack([
+                b.curvature.clamp(min=1e-4) for b in self.blocks
+            ]).to(dtype=torch.float32)
+        c_floats: list[float] = _c_all.tolist()   # one sync here
+
         # ── Run blocks ────────────────────────────────────────────────────
         for i, block in enumerate(self.blocks):
+            c_f = c_floats[i]
             if self.use_ckpt:
-                # use_reentrant=False: safer with custom autograd functions
-                x_new, al = ckpt_fn(block._forward_inner, x, use_reentrant=False)
+                # use_reentrant=False: safer with custom autograd functions.
+                # Pass c_f as a non-tensor arg — checkpoint accepts primitives.
+                x_new, al = ckpt_fn(block._forward_inner, x, c_f, use_reentrant=False)
             else:
-                x_new, al = block(x)
+                x_new, al = block._forward_inner(x, c_f)
 
             x = x_new
             aux_loss = aux_loss + al

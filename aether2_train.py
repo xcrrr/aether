@@ -218,13 +218,16 @@ def set_lr(opt: torch.optim.Optimizer, lr: float) -> None:
 def picky_thresholds(step: int, cfg: Aether2Config) -> tuple[float, float]:
     """Return curriculum-adjusted (ce_min, ce_max) for the Picky Learner.
 
-    During warmup, thresholds are relaxed so that high-CE early-training
-    batches are not all rejected.  After curriculum_warmup steps, the
-    full [picky_ce_min, picky_ce_max] window is enforced.
+    Warmup length = max(curriculum_warmup, max_steps * curriculum_end_pct)
+    so the window tightens proportionally to total training length.
+    At t=0: window = [0, 20.0]  (accept everything including high-CE early batches)
+    At t=1: window = [ce_min, ce_max]  (full filtering)
     """
     if not cfg.curriculum_enabled:
         return cfg.picky_ce_min, cfg.picky_ce_max
-    t = min(1.0, step / max(cfg.curriculum_warmup, 1))
+    warmup = max(cfg.curriculum_warmup,
+                 int(cfg.max_steps * cfg.curriculum_end_pct))
+    t = min(1.0, step / max(warmup, 1))
     ce_min = cfg.picky_ce_min * t
     ce_max = cfg.picky_ce_max + (20.0 - cfg.picky_ce_max) * (1.0 - t)
     return ce_min, ce_max
@@ -235,12 +238,17 @@ def picky_thresholds(step: int, cfg: Aether2Config) -> tuple[float, float]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def vram_stats(device: str) -> tuple[float, float]:
-    """Return (allocated_GiB, total_GiB) for the given device."""
+    """Return (used_GiB, total_GiB) using driver-level query.
+
+    torch.cuda.mem_get_info() is equivalent to rocm-smi and captures all
+    allocations including Adam m/v states that memory_allocated() misses on ROCm.
+    """
     if not torch.cuda.is_available():
         return 0.0, 0.0
-    alloc = torch.cuda.memory_allocated(device) / (1024 ** 3)
-    total = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
-    return alloc, total
+    free, total = torch.cuda.mem_get_info(0)
+    used = (total - free) / (1024 ** 3)
+    total_gib = total / (1024 ** 3)
+    return used, total_gib
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -252,7 +260,7 @@ def save_checkpoint(
     model: Aether2Model,
     shadow: ShadowModel,
     opt: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: torch.amp.GradScaler,
     cfg: Aether2Config,
     logger: logging.Logger,
     allocator: "FluidPowerAllocator | None" = None,
@@ -300,7 +308,7 @@ def load_checkpoint(
     model: Aether2Model,
     shadow: ShadowModel,
     opt: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: torch.amp.GradScaler,
     logger: logging.Logger,
     allocator: "FluidPowerAllocator | None" = None,
     rosetta: "RosettaObserver | None" = None,
@@ -380,8 +388,8 @@ def train(
     # BF16 weights: halves the ~2.7 GiB FP32 footprint to ~1.35 GiB.
     # All Poincaré ops already cast to float32 internally, so BF16 params
     # are safe. Gradient accumulation and optimizer states are still FP32.
-    model  = Aether2Model(cfg).to(device=device, dtype=torch.bfloat16)
-    shadow = ShadowModel(cfg).to(device=device, dtype=torch.bfloat16)
+    model  = Aether2Model(cfg).to(device=device, dtype=dtype)
+    shadow = ShadowModel(cfg).to(device=device, dtype=dtype)
     model.print_summary()
     total_p = model.count_parameters()
     logger.info(f"Total parameters: {total_p / 1e6:.1f}M")
@@ -391,7 +399,7 @@ def train(
     # ── RosettaObserver (latent-space interpretability probe) ─────────────────
     rosetta: RosettaObserver | None = None
     if cfg.rosetta_enabled:
-        rosetta = RosettaObserver(cfg).to(device=device, dtype=torch.bfloat16)
+        rosetta = RosettaObserver(cfg).to(device=device, dtype=dtype)
         r_params = sum(p.numel() for p in rosetta.parameters())
         logger.info(
             f"RosettaObserver: ON  "
@@ -401,7 +409,7 @@ def train(
     # ── Fluid Power Allocator (optional) ─────────────────────────────────────
     allocator: FluidPowerAllocator | None = None
     if cfg.fpa_enabled:
-        allocator = FluidPowerAllocator(cfg).to(device=device, dtype=torch.bfloat16)
+        allocator = FluidPowerAllocator(cfg).to(device=device, dtype=dtype)
         fpa_params = sum(p.numel() for p in allocator.parameters())
         logger.info(
             f"Fluid Power Allocation: ON  "

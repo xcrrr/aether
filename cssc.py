@@ -26,25 +26,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from aether2_config import Aether2Config
+from model import RMSNorm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-class RMSNorm(nn.Module):
-    """Root-Mean-Square normalisation (no bias). Matches model.py RMSNorm."""
-
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_f = x.float()
-        rms = (x_f.pow(2).mean(dim=-1, keepdim=True) + self.eps).rsqrt()
-        return (x_f * rms).to(x.dtype) * self.weight
-
 
 def _hyperbolic_decay_bias(
     T_q: int,
@@ -210,6 +197,11 @@ class CSSCAttention(nn.Module):
         # Per-head attention entropy tracking (for visualisation)
         self._last_expert_balance: list[float] = [0.33, 0.33, 0.34]
 
+        # Bias cache: reuse static attention masks/biases across forward calls.
+        # Keys are (T_q, T_k, device_str, dtype_str); T is constant during training
+        # so these are computed once and reused for the entire run.
+        self._bias_cache: dict[tuple, torch.Tensor] = {}
+
     # ── Internal pooling ────────────────────────────────────────────────────
 
     @staticmethod
@@ -250,32 +242,39 @@ class CSSCAttention(nn.Module):
     # ── Bias caching ────────────────────────────────────────────────────────
 
     def _get_token_bias(self, T: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        return _window_mask(T, self.window_size, device, dtype)
+        key = ("tok", T, str(device), str(dtype))
+        if key not in self._bias_cache:
+            self._bias_cache[key] = _window_mask(T, self.window_size, device, dtype)
+        return self._bias_cache[key]
 
     def _get_sent_bias(
         self, T_q: int, T_k: int, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
-        """Decay bias in sentence-segment space.
+        """Decay bias in sentence-segment space (cached)."""
+        key = ("sent", T_q, T_k, str(device), str(dtype))
+        if key in self._bias_cache:
+            return self._bias_cache[key]
 
-        query position i attends to segment j → temporal distance in sentence units.
-        """
-        q_idx = torch.arange(T_q, device=device, dtype=dtype)       # token positions
-        k_idx = torch.arange(T_k, device=device, dtype=dtype)        # segment indices
-
-        # Token i belongs to segment i // stride
-        q_seg = (q_idx // self.sentence_stride).unsqueeze(1)         # (T_q, 1)
-        k_seg = k_idx.unsqueeze(0)                                    # (1, T_k)
+        q_idx = torch.arange(T_q, device=device, dtype=dtype)
+        k_idx = torch.arange(T_k, device=device, dtype=dtype)
+        q_seg = (q_idx // self.sentence_stride).unsqueeze(1)
+        k_seg = k_idx.unsqueeze(0)
         dist = (q_seg - k_seg).abs().float()
         bias = -torch.log1p(self.decay_alpha * dist)
-        # Causal in segment space: future segments are masked
         future = k_seg > q_seg
         bias = bias.masked_fill(future, float("-inf"))
-        return bias.unsqueeze(0).unsqueeze(0)                        # (1,1,T_q,T_k)
+        result = bias.unsqueeze(0).unsqueeze(0)
+        self._bias_cache[key] = result
+        return result
 
     def _get_block_bias(
         self, T_q: int, T_k: int, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
-        """Decay bias in block space."""
+        """Decay bias in block space (cached)."""
+        key = ("blk", T_q, T_k, str(device), str(dtype))
+        if key in self._bias_cache:
+            return self._bias_cache[key]
+
         q_idx = torch.arange(T_q, device=device, dtype=dtype)
         k_idx = torch.arange(T_k, device=device, dtype=dtype)
         q_blk = (q_idx // self.block_size).unsqueeze(1)
@@ -284,7 +283,9 @@ class CSSCAttention(nn.Module):
         bias = -torch.log1p(self.decay_alpha * dist)
         future = k_blk > q_blk
         bias = bias.masked_fill(future, float("-inf"))
-        return bias.unsqueeze(0).unsqueeze(0)
+        result = bias.unsqueeze(0).unsqueeze(0)
+        self._bias_cache[key] = result
+        return result
 
     # ── Forward ─────────────────────────────────────────────────────────────
 
@@ -298,8 +299,10 @@ class CSSCAttention(nn.Module):
         dtype = x.dtype
 
         # ── Scale 1: Token-level (local sliding window) ──────────────────
+        # Request bias in the model's dtype (BF16 during training) so the cached
+        # tensor needs no further .to() cast inside _ScaleAttention.forward().
         x1 = self.norm_token(x)
-        bias_tok = self._get_token_bias(T, dev, torch.float32).to(dtype)
+        bias_tok = self._get_token_bias(T, dev, dtype)
         out1 = self.token_attn(x1, x1, bias_tok)               # (B, T, D)
 
         # ── Scale 2: Sentence-level (pooled segments) ────────────────────
@@ -309,7 +312,7 @@ class CSSCAttention(nn.Module):
         if T_s == 0:
             out2 = torch.zeros_like(x)
         else:
-            bias_sent = self._get_sent_bias(T, T_s, dev, torch.float32).to(dtype)
+            bias_sent = self._get_sent_bias(T, T_s, dev, dtype)
             out2 = self.sentence_attn(x2, x2_pooled, bias_sent)  # (B, T, D)
 
         # ── Scale 3: Block-level (pooled blocks) ─────────────────────────
@@ -319,7 +322,7 @@ class CSSCAttention(nn.Module):
         if T_b == 0:
             out3 = torch.zeros_like(x)
         else:
-            bias_blk = self._get_block_bias(T, T_b, dev, torch.float32).to(dtype)
+            bias_blk = self._get_block_bias(T, T_b, dev, dtype)
             out3 = self.block_attn(x3, x3_pooled, bias_blk)     # (B, T, D)
 
         # ── Blend with learned scale weights ─────────────────────────────

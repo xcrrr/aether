@@ -24,6 +24,14 @@ class Aether2Config(OmegaConfig):
     ff_hidden: int = 2_816           # 2816 = 4×704; replaces parent 2817
     n_moe_experts: int = 4           # keep parent assertion happy
 
+    # ── Picky Learner pre-training override ────────────────────────────────
+    # Parent default picky_ce_max=5.0 was designed for fine-tuning.
+    # Pre-training starts at CE≈10 (random init); at step 2000 the parent
+    # value would reject every batch → training stalls.
+    # 12.0 filters only genuinely broken/corrupted batches (CE > 12 is
+    # impossible for a healthy sequence at any point in pre-training).
+    picky_ce_max: float = 12.0
+
     # ── Memory-safe training defaults (override parent for 16 GB VRAM) ────
     # micro_batch=4 + grad_accum=16 keeps effective batch=64.
     # VRAM budget with cpu_offload_optimizer=False (default):
@@ -43,6 +51,16 @@ class Aether2Config(OmegaConfig):
     # (~5.6 GiB per optimizer step) and cuts throughput by ~3–5×.
     # Enable only if you hit OOM (e.g. on a GPU with < 12 GiB VRAM).
     cpu_offload_optimizer: bool = False
+
+    # ── SSM scan: larger chunks → fewer Python loop iterations, same VRAM ──
+    # Default OmegaConfig chunk_size=64 gives T/64 = 8 Python iterations per SSM.
+    # At chunk_size=256, T/256 = ⌈520/256⌉ = 3 iterations — 62% fewer calls.
+    # Per-chunk gradient checkpointing is kept (scan_use_chunk_ckpt=True) so
+    # VRAM stays bounded: only ONE chunk's (B,chunk,Di,N) intermediates are
+    # live at a time during backward.  chunk_size=256 uses 4× more peak activation
+    # per chunk (~130 MB vs ~33 MB) but still well within the 16 GiB budget.
+    scan_use_chunk_ckpt: bool = True    # keep per-chunk ckpt for VRAM safety
+    scan_chunk_size: int = 128          # 5 chunks instead of 8 (default 64); +0.86 GB peak
 
     # ── CSSC v2 — Cross-Scale Spatiotemporal Correlation ──────────────────
     # Replaces the Mamba-Δ curvature coupling with a full multi-head
@@ -203,12 +221,15 @@ class Aether2Config(OmegaConfig):
             cfg.cpu_offload_optimizer = False
         if getattr(args, "fpa", False):
             cfg.fpa_enabled = True
+        if getattr(args, "no_bf16", False):
+            cfg.use_bf16 = False
         for attr in ("fpa_max_iters", "fpa_ponder_weight"):
             if hasattr(args, attr) and getattr(args, attr) is not None:
                 object.__setattr__(cfg, attr, getattr(args, attr))
         # Training overrides
         for attr in ("max_steps", "micro_batch", "grad_accum_steps",
-                     "learning_rate", "seed", "data_path", "checkpoint_every"):
+                     "learning_rate", "seed", "data_path", "checkpoint_every",
+                     "checkpoint_dir", "log_file", "log_every"):
             if hasattr(args, attr) and getattr(args, attr) is not None:
                 object.__setattr__(cfg, attr, getattr(args, attr))
         return cfg
@@ -237,6 +258,8 @@ class Aether2Config(OmegaConfig):
         parser.add_argument("--fpa-ponder-weight", type=float, default=None,
                             dest="fpa_ponder_weight",
                             help="ACT regulariser weight (default 0.01)")
+        parser.add_argument("--no-bf16", action="store_true",
+                    help="Disable BF16 and keep weights/activations in FP32")
         # Training
         parser.add_argument("--max-steps", type=int, default=None)
         parser.add_argument("--micro-batch", type=int, default=None)
@@ -247,6 +270,13 @@ class Aether2Config(OmegaConfig):
         parser.add_argument("--checkpoint-every", type=int, default=None,
                             dest="checkpoint_every",
                             help="Save checkpoint every N steps (default 2000)")
+        parser.add_argument("--log-every", type=int, default=None,
+                    dest="log_every",
+                    help="Emit training metrics every N steps (default 50)")
+        parser.add_argument("--checkpoint-dir", type=str, default=None,
+                    help="Checkpoint output directory (use a Drive path in Colab)")
+        parser.add_argument("--log-file", type=str, default=None,
+                    help="Log file path (use a Drive path in Colab if desired)")
         parser.add_argument("--data-path", type=str, default=None)
         parser.add_argument("--seed", type=int, default=None)
         parser.add_argument("--dashboard", action="store_true",

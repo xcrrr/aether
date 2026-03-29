@@ -294,30 +294,40 @@ def _scan_chunk(
 
 
 def _chunked_selective_scan(
-    x:          torch.Tensor,   # (B, T, D_inner)
-    delta:      torch.Tensor,   # (B, T, D_inner)
-    A:          torch.Tensor,   # (D_inner, d_state)  — negative values
-    B:          torch.Tensor,   # (B, T, d_state)
-    C:          torch.Tensor,   # (B, T, d_state)
-    D:          torch.Tensor,   # (D_inner,)
-    chunk_size: int = 64,
+    x:              torch.Tensor,   # (B, T, D_inner)
+    delta:          torch.Tensor,   # (B, T, D_inner)
+    A:              torch.Tensor,   # (D_inner, d_state)  — negative values
+    B:              torch.Tensor,   # (B, T, d_state)
+    C:              torch.Tensor,   # (B, T, d_state)
+    D:              torch.Tensor,   # (D_inner,)
+    chunk_size:     int = 64,
+    use_chunk_ckpt: bool = True,
 ) -> torch.Tensor:
-    """Chunked parallel scan with per-chunk gradient checkpointing.
+    """Selective scan with optional per-chunk gradient checkpointing.
 
-    During training (grad enabled): each chunk is wrapped in
-    torch.utils.checkpoint so only ONE chunk's backward intermediates are
-    live at a time.  Peak VRAM scales as O(chunk_size × Di × N × B) instead
-    of O(T × Di × N × B), enabling large micro_batch on 16 GB VRAM.
+    use_chunk_ckpt=True (default):
+        Each chunk is wrapped in torch.utils.checkpoint — only ONE chunk's
+        backward intermediates are live at a time.  Peak VRAM scales as
+        O(chunk_size × Di × N × B) instead of O(T × Di × N × B).
+        Use this when there is NO block-level gradient checkpointing above.
 
-    During inference (no grad): runs each chunk directly with no overhead.
+    use_chunk_ckpt=False (Aether2 default):
+        No per-chunk checkpointing.  Relies on block-level gradient checkpointing
+        in Aether2Model.  Eliminates nested recomputation overhead (~3× speedup
+        during backward).  Safe on 16 GiB: one block's SSM intermediates
+        (~1.5 GiB) fit alongside model params + Adam states.
 
-    T/chunk_size Python-level dispatch iterations (e.g. 8 for chunk_size=64).
+    chunk_size=0: process the full sequence as a single chunk (no Python loop).
+
     All arithmetic in float32 for numerical stability.
     """
     from torch.utils.checkpoint import checkpoint as _ckpt
 
     B_sz, T, Di = x.shape
     N = A.shape[1]
+
+    # chunk_size=0 means process the entire sequence in one shot
+    eff_chunk = T if chunk_size <= 0 else chunk_size
 
     x_f     = x.float()
     delta_f = delta.float()
@@ -329,16 +339,19 @@ def _chunked_selective_scan(
     y = torch.empty(B_sz, T, Di, device=x.device, dtype=torch.float32)
     h = torch.zeros(B_sz, Di, N, device=x.device, dtype=torch.float32)
 
-    use_ckpt = torch.is_grad_enabled()
+    # Per-chunk ckpt only makes sense during a training forward pass.
+    # When use_chunk_ckpt=False we skip checkpointing entirely regardless
+    # of grad mode (block-level ckpt above us handles memory).
+    apply_ckpt = use_chunk_ckpt and torch.is_grad_enabled()
 
-    for cs in range(0, T, chunk_size):
-        ce   = min(cs + chunk_size, T)
+    for cs in range(0, T, eff_chunk):
+        ce   = min(cs + eff_chunk, T)
         dt_c = delta_f[:, cs:ce, :]
         x_c  = x_f[:, cs:ce, :]
         B_c  = B_f[:, cs:ce, :]
         C_c  = C_f[:, cs:ce, :]
 
-        if use_ckpt:
+        if apply_ckpt:
             y_c, h = _ckpt(
                 _scan_chunk, h, dt_c, x_c, B_c, C_c, A_f, D_f,
                 use_reentrant=False,
@@ -387,6 +400,10 @@ class PurePyTorchSSM(nn.Module):
         self.d_state  = N
         self.dt_rank  = R
 
+        # Scan performance settings — read from config with safe defaults
+        self._use_chunk_ckpt = getattr(cfg, "scan_use_chunk_ckpt", True)
+        self._chunk_size     = getattr(cfg, "scan_chunk_size", 64)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -417,7 +434,11 @@ class PurePyTorchSSM(nn.Module):
 
         A = -torch.exp(self.A_log.float())
 
-        y = _chunked_selective_scan(x_s, delta, A, B_ssm, C_ssm, self.D)
+        y = _chunked_selective_scan(
+            x_s, delta, A, B_ssm, C_ssm, self.D,
+            chunk_size=self._chunk_size,
+            use_chunk_ckpt=self._use_chunk_ckpt,
+        )
         y = y * F.silu(z)
         out = self.out_proj(y)
 

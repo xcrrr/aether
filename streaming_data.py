@@ -59,23 +59,41 @@ class CircularTokenBuffer:
         self._lock   = threading.Lock()
         self._not_empty = threading.Condition(self._lock)
 
-    def _write_one(self, token_id: int, trust_score: float) -> None:
-        with self._lock:
-            self.tokens[self._write_ptr] = token_id
-            self.trust[self._write_ptr]  = trust_score
-            self._write_ptr = (self._write_ptr + 1) % self.capacity
-            self._available = min(self._available + 1, self.capacity)
-            self._not_empty.notify()
-
     def write_sequence(self, ids: list[int], trust: float) -> None:
-        for tok in ids:
-            # Block when buffer is 95% full (backpressure to producer)
-            while True:
-                with self._lock:
-                    if self._available < self.capacity * 0.95:
-                        break
-                time.sleep(0.001)
-            self._write_one(tok, trust)
+        """Write an entire token sequence in a single lock acquisition.
+
+        Batching eliminates the per-token lock overhead of the original
+        per-token write loop (512 lock acquire/release → 1 per sequence).
+        Backpressure waits until there is room for ALL tokens at once.
+        """
+        n = len(ids)
+        if n == 0:
+            return
+
+        # Backpressure: wait until there is room for n more tokens
+        threshold = int(self.capacity * 0.95)
+        while True:
+            with self._lock:
+                if self._available + n <= threshold:
+                    break
+            time.sleep(0.001)
+
+        # Batch-write all tokens under a single lock
+        with self._lock:
+            end = self._write_ptr + n
+            ids_tensor = torch.tensor(ids, dtype=torch.long)
+            if end <= self.capacity:
+                self.tokens[self._write_ptr:end] = ids_tensor
+                self.trust[self._write_ptr:end]  = trust
+            else:
+                first = self.capacity - self._write_ptr
+                self.tokens[self._write_ptr:] = ids_tensor[:first]
+                self.tokens[:n - first]        = ids_tensor[first:]
+                self.trust[self._write_ptr:]   = trust
+                self.trust[:n - first]         = trust
+            self._write_ptr = end % self.capacity
+            self._available = min(self._available + n, self.capacity)
+            self._not_empty.notify_all()
 
     def read_window(self, length: int) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Read a contiguous window of `length` tokens.
@@ -259,9 +277,9 @@ class StreamingJSONLDataset:
         self._steps += 1
 
         return {
-            "input_ids":    input_ids.to(device),
-            "labels":       labels.to(device),
-            "trust_scores": trust_scores.to(device),
+            "input_ids":    input_ids.to(device, non_blocking=True),
+            "labels":       labels.to(device, non_blocking=True),
+            "trust_scores": trust_scores.to(device, non_blocking=True),
         }
 
     def get_batch_blocking(

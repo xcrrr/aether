@@ -155,6 +155,17 @@ class OmegaConfig:
     use_gradient_checkpointing: bool = True   # Saves ~6 GiB; essential for OOM safety on 16 GB
     cpu_offload: bool = False                 # Model fits in 16 GB VRAM — no CPU transfer needed
 
+    # ── SSM scan performance knobs ─────────────────────────────────────────
+    # scan_use_chunk_ckpt=True (default): per-chunk gradient checkpointing inside
+    # the SSM scan saves peak VRAM at the cost of extra recomputation.
+    # Set False when block-level gradient checkpointing is active (Aether2) —
+    # block-level ckpt already handles memory; nested chunk ckpt only wastes compute.
+    scan_use_chunk_ckpt: bool = True
+    # scan_chunk_size: number of timesteps processed per SSM chunk.
+    # 0 = full sequence in one shot (no Python-loop overhead; safe when
+    # scan_use_chunk_ckpt=False and block-level ckpt is active).
+    scan_chunk_size: int = 64
+
     # ------------------------------------------------------------------ #
     # Derived properties (read-only helpers)                              #
     # ------------------------------------------------------------------ #

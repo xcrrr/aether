@@ -99,10 +99,7 @@ aether2/
 │   └── omega_tokenizer.json  Custom 32k BPE tokenizer
 │
 ├── Utils  (standalone tools, not on the critical path)
-│   ├── utils/inference.py      Text generation from a saved checkpoint
-│   ├── utils/generate_data.py  Local stdlib data generation (no internet)
-│   ├── utils/tokenizer.py      BPE tokenizer implementation
-│   └── utils/probe_fields.py   HuggingFace field probe (diagnostics)
+│   └── utils/tokenizer.py      BPE tokenizer implementation
 │
 └── Runtime
     ├── venv/                 Python virtual environment
@@ -116,7 +113,7 @@ aether2/
 ## Quick Start
 
 ```bash
-cd /home/xcrr1/aether2
+cd aether2
 source venv/bin/activate
 
 # ROCm environment (required for AMD GPU)
